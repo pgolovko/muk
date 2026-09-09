@@ -85,6 +85,12 @@ class GoogleProvider(ProviderBase):
             tools.append({CODE_EXECUTION_TOOL_KEY: {}})
         if tools:
             body['tools'] = tools
+        body['tool_config'] = {
+            "function_calling_config": {
+                "mode": "AUTO"
+            },
+            "include_server_side_tool_invocations": True 
+        }
         return self._invoke_with_reasoning_retry(
             model,
             lambda callback: self._invoke(model, body, callback),
@@ -149,15 +155,16 @@ class GoogleProvider(ProviderBase):
                     args = json.loads(item.get('arguments') or '{}')
                 except ValueError:
                     args = {}
-                append(
-                    'model',
-                    {
-                        'functionCall': {
-                            'name': item.get('name') or '',
-                            'args': args,
-                        },
+                part = {
+                    'functionCall': {
+                        'name': item.get('name') or '',
+                        'args': args,
                     },
-                )
+                }
+                sig = item.get('signature') or item.get('thought_signature') or item.get('thoughtSignature')
+                if sig:
+                    part['thoughtSignature'] = sig
+                append('model', part)
                 continue
             if item_type == 'function_call_output':
                 call_id = item.get('call_id')
@@ -206,6 +213,14 @@ class GoogleProvider(ProviderBase):
             chunk_type = chunk.get('type')
             if chunk_type == 'muk_ai_attachment':
                 parts.append(cls._attachment_to_google(chunk))
+            elif chunk_type == 'muk_ai_thinking':
+                part = {'thought': True}
+                if chunk.get('thinking'):
+                    part['text'] = chunk['thinking']
+                if chunk.get('signature'):
+                    part['thoughtSignature'] = chunk['signature']
+                if set(part) != {'thought'}:
+                    parts.append(part)
             elif chunk.get('text'):
                 parts.append({'text': chunk['text']})
         return parts
@@ -275,6 +290,7 @@ class GoogleProvider(ProviderBase):
         tool_calls = []
         carry_inputs = []
         message_text_parts = []
+        reasoning_blocks = []
         if candidates:
             content = candidates[0].get('content') or {}
             for part in content.get('parts') or []:
@@ -284,10 +300,19 @@ class GoogleProvider(ProviderBase):
                     message_text_parts,
                     tool_calls,
                     carry_inputs,
+                    reasoning_blocks,
                 )
         if message_text_parts:
+            reasoning_blocks.append(
+                {
+                    'type': 'output_text',
+                    'text': ''.join(message_text_parts),
+                }
+            )
+        if reasoning_blocks:
             carry_inputs.insert(
-                0, self._assistant_text_carry(''.join(message_text_parts))
+                0,
+                {'role': 'assistant', 'content': reasoning_blocks},
             )
         usage = payload.get('usageMetadata') or {}
         result = {
@@ -312,8 +337,17 @@ class GoogleProvider(ProviderBase):
         message_text_parts: list,
         tool_calls: list,
         carry_inputs: list,
+        reasoning_blocks: list,
     ) -> None:
         """Consume one non-streaming response part into the accumulators."""
+        if part.get('thought') or 'thoughtSignature' in part:
+            reasoning_blocks.append(
+                {
+                    'type': 'muk_ai_thinking',
+                    'thinking': part.get('text') or '',
+                    'signature': part.get('thoughtSignature') or '',
+                }
+            )
         if 'functionCall' in part:
             fc = part['functionCall']
             name = fc.get('name') or ''
@@ -327,21 +361,23 @@ class GoogleProvider(ProviderBase):
                     '_parse_error': None,
                 }
             )
-            carry_inputs.append(
-                {
-                    'type': 'function_call',
-                    'name': name,
-                    'arguments': json.dumps(args, default=str),
-                    'call_id': call_id,
-                }
-            )
-            return
+            fc_carry = {
+                'type': 'function_call',
+                'name': name,
+                'arguments': json.dumps(args, default=str),
+                'call_id': call_id,
+            }
+            sig = part.get('thoughtSignature')
+            if sig:
+                fc_carry['signature'] = sig
+                fc_carry['thought_signature'] = sig
+                fc_carry['thoughtSignature'] = sig
+            carry_inputs.append(fc_carry)
         if 'text' in part:
             text = part.get('text') or ''
             if text:
                 text_parts.append(text)
                 message_text_parts.append(text)
-            return
         if 'inlineData' in part:
             data = part['inlineData']
             mime = data.get('mimeType') or 'image/png'
@@ -349,14 +385,12 @@ class GoogleProvider(ProviderBase):
             snippet = f'![image](data:{mime};base64,{b64})'
             text_parts.append(snippet)
             message_text_parts.append(snippet)
-            return
         if 'executableCode' in part:
             code = part['executableCode']
             lang = (code.get('language') or '').lower()
             snippet = f'```{lang}\n{code.get("code") or ""}\n```'
             text_parts.append(snippet)
             message_text_parts.append(snippet)
-            return
         if 'codeExecutionResult' in part:
             result = part['codeExecutionResult']
             snippet = f'```\n{result.get("output") or ""}\n```'
@@ -384,6 +418,7 @@ class GoogleProvider(ProviderBase):
         """Stream a generateContent request and assemble the final result."""
         text_parts = []
         message_text_parts = []
+        reasoning_blocks = []
         tool_calls = []
         carry_inputs = []
         usage = self._usage()
@@ -396,12 +431,18 @@ class GoogleProvider(ProviderBase):
                 message_text_parts,
                 tool_calls,
                 carry_inputs,
+                reasoning_blocks,
                 usage,
                 meta,
             )
         if message_text_parts:
+            reasoning_blocks.append(
+                {'type': 'output_text', 'text': ''.join(message_text_parts)}
+            )
+        if reasoning_blocks:
             carry_inputs.insert(
-                0, self._assistant_text_carry(''.join(message_text_parts))
+                0,
+                {'role': 'assistant', 'content': reasoning_blocks},
             )
         result = {
             'text': ''.join(text_parts).strip(),
@@ -421,6 +462,7 @@ class GoogleProvider(ProviderBase):
         message_text_parts: list,
         tool_calls: list,
         carry_inputs: list,
+        reasoning_blocks: list,
         usage: dict,
         meta: dict,
     ) -> None:
@@ -454,15 +496,16 @@ class GoogleProvider(ProviderBase):
                     message_text_parts,
                     tool_calls,
                     carry_inputs,
+                    reasoning_blocks,
                 )
-        meta = event.get('usageMetadata') or {}
-        if meta:
-            if 'promptTokenCount' in meta:
-                usage['input_tokens'] = meta['promptTokenCount']
-            if 'candidatesTokenCount' in meta:
-                usage['output_tokens'] = meta['candidatesTokenCount']
-            if 'cachedContentTokenCount' in meta:
-                usage['cache_read_tokens'] = meta['cachedContentTokenCount']
+        meta_usage = event.get('usageMetadata') or {}
+        if meta_usage:
+            if 'promptTokenCount' in meta_usage:
+                usage['input_tokens'] = meta_usage['promptTokenCount']
+            if 'candidatesTokenCount' in meta_usage:
+                usage['output_tokens'] = meta_usage['candidatesTokenCount']
+            if 'cachedContentTokenCount' in meta_usage:
+                usage['cache_read_tokens'] = meta_usage['cachedContentTokenCount']
 
     def _stream_part(
         self,
@@ -472,16 +515,28 @@ class GoogleProvider(ProviderBase):
         message_text_parts: list,
         tool_calls: list,
         carry_inputs: list,
+        reasoning_blocks: list,
     ) -> None:
         """Consume one streaming response part into the accumulators and forward deltas."""
+        if part.get('thought') or 'thoughtSignature' in part:
+            text = part.get('text') or ''
+            if text:
+                self._call_on_delta(on_delta, 'reasoning', {'delta': text})
+            signature = part.get('thoughtSignature') or ''
+            if text or signature:
+                reasoning_blocks.append(
+                    {
+                        'type': 'muk_ai_thinking',
+                        'thinking': text,
+                        'signature': signature,
+                    }
+                )
         if 'text' in part:
             text = part.get('text') or ''
-            if not text:
-                return
-            text_parts.append(text)
-            message_text_parts.append(text)
-            self._call_on_delta(on_delta, 'text', {'delta': text})
-            return
+            if text:
+                text_parts.append(text)
+                message_text_parts.append(text)
+                self._call_on_delta(on_delta, 'text', {'delta': text})
         if 'functionCall' in part:
             fc = part['functionCall']
             name = fc.get('name') or ''
@@ -512,15 +567,18 @@ class GoogleProvider(ProviderBase):
                     '_parse_error': None,
                 }
             )
-            carry_inputs.append(
-                {
-                    'type': 'function_call',
-                    'name': name,
-                    'arguments': args_json,
-                    'call_id': call_id,
-                }
-            )
-            return
+            fc_carry = {
+                'type': 'function_call',
+                'name': name,
+                'arguments': args_json,
+                'call_id': call_id,
+            }
+            sig = part.get('thoughtSignature')
+            if sig:
+                fc_carry['signature'] = sig
+                fc_carry['thought_signature'] = sig
+                fc_carry['thoughtSignature'] = sig
+            carry_inputs.append(fc_carry)
         if 'inlineData' in part:
             data = part['inlineData']
             mime = data.get('mimeType') or 'image/png'
@@ -529,7 +587,6 @@ class GoogleProvider(ProviderBase):
             text_parts.append(snippet)
             message_text_parts.append(snippet)
             self._call_on_delta(on_delta, 'text', {'delta': snippet})
-            return
         if 'executableCode' in part:
             code = part['executableCode']
             lang = (code.get('language') or '').lower()
@@ -537,7 +594,6 @@ class GoogleProvider(ProviderBase):
             text_parts.append(snippet)
             message_text_parts.append(snippet)
             self._call_on_delta(on_delta, 'text', {'delta': snippet})
-            return
         if 'codeExecutionResult' in part:
             result = part['codeExecutionResult']
             snippet = f'```\n{result.get("output") or ""}\n```'

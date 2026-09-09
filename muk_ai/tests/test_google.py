@@ -681,3 +681,122 @@ class TestAiGoogleProvider(AITestCommon):
         self.assertIn('```python', result['text'])
         self.assertIn('print(1)', result['text'])
         self.assertIn('1\n', result['text'])
+
+    def test_inputs_to_contents_roundtrips_thought_signatures(self):
+        _, contents = GoogleProvider._inputs_to_contents(
+            [
+                {
+                    'role': 'assistant',
+                    'content': [
+                        {
+                            'type': 'muk_ai_thinking',
+                            'thinking': 'I am reasoning',
+                            'signature': 'sig-123',
+                        },
+                        {
+                            'type': 'output_text',
+                            'text': 'final answer',
+                        },
+                    ],
+                },
+                {'role': 'user', 'content': [{'type': 'input_text', 'text': 'next'}]},
+            ]
+        )
+        self.assertEqual(
+            contents[0]['parts'][0],
+            {'text': 'I am reasoning', 'thought': True, 'thoughtSignature': 'sig-123'},
+        )
+        self.assertEqual(contents[0]['parts'][1]['text'], 'final answer')
+        self.assertEqual(contents[1]['role'], 'user')
+
+    def test_response_captures_thought_signature_in_carry_inputs(self):
+        body = {
+            'candidates': [
+                {
+                    'content': {
+                        'role': 'model',
+                        'parts': [
+                            {'text': 'I am thinking', 'thought': True, 'thoughtSignature': 'sig-123'},
+                            {'text': 'Here is the answer'},
+                        ],
+                    },
+                    'finishReason': 'STOP',
+                }
+            ],
+            'usageMetadata': {'promptTokenCount': 3, 'candidatesTokenCount': 2},
+        }
+        with patch.object(
+            requests.Session, 'post', return_value=self._mock_http_response(body)
+        ):
+            result = self.provider._request_responses(inputs=[])
+        self.assertEqual(result['text'], 'Here is the answer')
+        carry = result['carry_inputs'][0]
+        self.assertEqual(carry['role'], 'assistant')
+        self.assertEqual(
+            carry['content'][0],
+            {
+                'type': 'muk_ai_thinking',
+                'thinking': 'I am thinking',
+                'signature': 'sig-123',
+            },
+        )
+        self.assertEqual(carry['content'][1]['type'], 'output_text')
+
+    def test_inputs_to_contents_includes_thought_signature_in_function_call(self):
+        _, contents = GoogleProvider._inputs_to_contents(
+            [
+                {
+                    'type': 'function_call',
+                    'name': 'do_something',
+                    'arguments': '{}',
+                    'call_id': 'fc-1',
+                    'signature': 'tool-sig-456',
+                }
+            ]
+        )
+        self.assertEqual(contents[0]['role'], 'model')
+        self.assertEqual(
+            contents[0]['parts'][0],
+            {
+                'functionCall': {'name': 'do_something', 'args': {}},
+                'thoughtSignature': 'tool-sig-456',
+            }
+        )
+
+    def test_response_captures_thought_signature_on_function_call_part(self):
+        body = {
+            'candidates': [
+                {
+                    'content': {
+                        'role': 'model',
+                        'parts': [
+                            {
+                                'functionCall': {'name': 'do_something', 'args': {}},
+                                'thoughtSignature': 'tool-sig-789',
+                            }
+                        ],
+                    },
+                    'finishReason': 'STOP',
+                }
+            ],
+            'usageMetadata': {'promptTokenCount': 1, 'candidatesTokenCount': 1},
+        }
+        with patch.object(
+            requests.Session, 'post', return_value=self._mock_http_response(body)
+        ):
+            result = self.provider._request_responses(inputs=[])
+        
+        self.assertEqual(result['carry_inputs'][0]['role'], 'assistant')
+        self.assertEqual(
+            result['carry_inputs'][0]['content'][0],
+            {
+                'type': 'muk_ai_thinking',
+                'thinking': '',
+                'signature': 'tool-sig-789',
+            }
+        )
+        
+        carry = result['carry_inputs'][1]
+        self.assertEqual(carry['type'], 'function_call')
+        self.assertEqual(carry['name'], 'do_something')
+        self.assertEqual(carry['signature'], 'tool-sig-789')
