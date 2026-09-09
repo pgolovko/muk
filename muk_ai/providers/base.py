@@ -98,6 +98,11 @@ class ProviderBase:
             or self.default_model
         )
 
+    @staticmethod
+    def _debug_json(value) -> str:
+        """Render a payload for debug logs without losing non-JSON-serializable values."""
+        return json.dumps(value, ensure_ascii=False, default=str, sort_keys=True)
+
     # ----------------------------------------------------------
     # Contract
     # ----------------------------------------------------------
@@ -190,6 +195,12 @@ class ProviderBase:
 
         :raise UserError: on HTTP or transport errors.
         """
+        _logger.debug(
+            '%s POST request: path=%s body=%s',
+            self.label,
+            path,
+            self._debug_json(body),
+        )
         try:
             response = self._http_session().post(
                 f'{self.api_url}{path}',
@@ -202,13 +213,26 @@ class ProviderBase:
             self._raise(getattr(error.response, 'text', '') or str(error))
         except requests.RequestException as error:
             self._raise(error)
-        return response.json()
+        result = response.json()
+        _logger.debug(
+            '%s POST response: path=%s response=%s',
+            self.label,
+            path,
+            self._debug_json(result),
+        )
+        return result
 
     def _post_stream(self, path: str, body: dict) -> Iterator[dict]:
         """POST a JSON body and yield decoded SSE ``data:`` payloads.
 
         :raise UserError: on HTTP, transport, or stream-idle errors.
         """
+        _logger.debug(
+            '%s stream request: path=%s body=%s',
+            self.label,
+            path,
+            self._debug_json(body),
+        )
         read_timeout = self.idle_timeout
         try:
             response = self._http_session().post(
@@ -243,7 +267,14 @@ class ProviderBase:
                 if not payload or payload == '[DONE]':
                     continue
                 try:
-                    yield json.loads(payload)
+                    event = json.loads(payload)
+                    _logger.debug(
+                        '%s stream event: path=%s event=%s',
+                        self.label,
+                        path,
+                        self._debug_json(event),
+                    )
+                    yield event
                 except ValueError:
                     continue
         finally:
