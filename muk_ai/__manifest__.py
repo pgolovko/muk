@@ -36,6 +36,7 @@
         'data/ir_cron.xml',
         'data/space.xml',
         'views/ir_model.xml',
+        'views/ir_actions_server.xml',
         'views/provider.xml',
         'views/model.xml',
         'views/agent.xml',

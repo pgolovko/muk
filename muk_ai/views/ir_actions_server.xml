@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<odoo>
+
+	<record id="view_server_action_form" model="ir.ui.view">
+		<field name="name">ir.actions.server.form.muk_ai</field>
+		<field name="model">ir.actions.server</field>
+		<field name="inherit_id" ref="base.view_server_action_form"/>
+		<field name="arch" type="xml">
+			<xpath expr="//field[@name='update_path']/.." position="before">
+				<group invisible="state != 'ai_start_session'">
+					<field name="ai_agent_id" required="state == 'ai_start_session'" options="{'no_create': True}"/>
+					<field name="ai_space_id" options="{'no_create': True}"/>
+					<field name="ai_prompt" required="state == 'ai_start_session'"/>
+				</group>
+			</xpath>
+		</field>
+	</record>
+
+</odoo>
